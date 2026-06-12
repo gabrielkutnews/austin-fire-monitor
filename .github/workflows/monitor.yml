@@ -1,0 +1,35 @@
+name: Austin Fire Monitor
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch: {}        # manual trigger for testing
+
+concurrency:                   # serialize runs so state.json never conflicts
+  group: austin-fire-monitor
+  cancel-in-progress: false
+
+permissions:
+  contents: write              # needed to commit state.json back
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: Run monitor
+        env:
+          ALL_SECRETS: ${{ toJSON(secrets) }}   # every secret, auto-mapped
+        run: python3 monitor.py
+      - name: Persist state
+        if: always()
+        run: |
+          if [[ -n "$(git status --porcelain state.json)" ]]; then
+            git config user.name  "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add state.json
+            git commit -m "Update state [skip ci]"
+            git push
+          fi

@@ -1,0 +1,10 @@
+{
+  "alert_prefixes": ["BOX", "BRUSH", "ATTACK", "ALERT", "WRESQT", "RESQT",
+                     "HMTF", "HMI", "HMCLAN", "FLOOD",
+                     "Traffic Injury Pri 1", "Traffic Injury Pri 2"],
+  "escalation_minutes": 45,
+  "tceq_counties": ["TRAVIS", "WILLIAMSON", "HAYS", "BASTROP", "CALDWELL"],
+  "tceq_cities": ["AUSTIN"],
+  "tceq_thresholds": {"GALLONS": 1000, "BARRELS": 50, "POUNDS": 5000},
+  "tceq_recent_days": 14
+}
