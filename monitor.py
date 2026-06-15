@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Austin Fire Incidents + TCEQ Spills -> Slack monitor, filtered for news value.
+"""Austin Fire + TCEQ Spills + r/Austin -> Slack monitor, filtered for news value.
 
-Two Socrata sources polled by one launchd job (every 300s), DMing a list of
-Slack users via a bot token (chat.postMessage). No LLM involved: every run
-costs two ~50-byte API probes, plus small delta fetches only when data changed.
+Three sources polled by one GitHub Actions cron job (every ~5 min), DMing a
+list of Slack users via a bot token (chat.postMessage). No LLM involved: each
+run is a few small API calls, with delta fetches only when data changed.
 
 Source 1 — Austin Real-Time Fire Incidents (wpu4-x69d):
   - New incidents DM only when issue_reported starts with one of
-    alert_prefixes (structure fires, rescues, hazmat, aircraft, Pri 1/2
+    alert_prefixes (structure fires, rescues, hazmat, aircraft, Pri 1
     traffic, ...).
   - Anything else is logged as "suppressed" but tracked; if it is still
     ACTIVE after escalation_minutes it DMs anyway (routine calls archive in
@@ -22,6 +22,12 @@ Source 2 — TCEQ Emergency Response Spills (data.texas.gov xagr-a3x2):
     (measured 18k in one day), so the delta fetch is server-side restricted
     to rcvd_dt within tceq_recent_days — old re-touched rows are never even
     downloaded. Non-matching recent spills get a "tceq suppressed" log line.
+
+Source 3 — r/Austin (Reddit OAuth, app-only):
+  - 🔴 keyword alert when a new post's title/body matches reddit_keywords;
+    📈 trending alert when any recent post crosses reddit_score_threshold.
+  - Needs REDDIT_CLIENT_ID/SECRET (GitHub Secrets or env); absent -> skipped.
+    Fail-isolated like TCEQ: Reddit errors never block fire/spill alerts.
 
 The bot token is read from the macOS Keychain (service 'austin-fire-monitor',
 account 'slack-bot-token'), falling back to slack_bot_token in config.json.
@@ -38,6 +44,8 @@ next run), 2 bot token / recipients not configured. A TCEQ outage alone never
 blocks fire alerts: it is logged and retried, fire processing continues.
 """
 
+import base64
+import html
 import json
 import os
 import re
@@ -46,6 +54,7 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -63,12 +72,26 @@ TCEQ_SEEN_PRUNE = timedelta(days=30)  # must exceed tceq_recent_days
 
 DEFAULT_PREFIXES = ["BOX", "BRUSH", "ATTACK", "ALERT", "WRESQT", "RESQT",
                     "HMTF", "HMI", "HMCLAN", "FLOOD",
-                    "Traffic Injury Pri 1", "Traffic Injury Pri 2"]
+                    "Traffic Injury Pri 1"]
 DEFAULT_ESCALATION_MIN = 45
 DEFAULT_TCEQ_COUNTIES = ["TRAVIS", "WILLIAMSON", "HAYS", "BASTROP", "CALDWELL"]
 DEFAULT_TCEQ_CITIES = ["AUSTIN"]
 DEFAULT_TCEQ_THRESHOLDS = {"GALLONS": 1000, "BARRELS": 50, "POUNDS": 5000}
 DEFAULT_TCEQ_RECENT_DAYS = 14
+
+REDDIT_TOKEN_URL = "https://www.reddit.com/api/v1/access_token"
+REDDIT_OAUTH = "https://oauth.reddit.com"
+DEFAULT_REDDIT_SUBREDDIT = "Austin"
+DEFAULT_REDDIT_KEYWORDS = [
+    "fire", "wildfire", "crash", "collision", "wreck", "shooting", "shooter",
+    "active shooter", "stabbing", "police", "apd", "swat", "standoff",
+    "evacuate", "evacuation", "flood", "flooding", "low water crossing",
+    "tornado", "severe weather", "boil water", "power outage", "outage",
+    "explosion", "hazmat", "amber alert", "silver alert", "protest",
+    "closure", "i-35", "mopac", "fatal", "homicide", "missing person"]
+DEFAULT_REDDIT_SCORE_THRESHOLD = 50
+DEFAULT_REDDIT_TRENDING_HOURS = 24
+DEFAULT_REDDIT_SEEN_PRUNE_DAYS = 3
 
 FIRE_FIELDS = ("traffic_report_id,published_date,issue_reported,address,"
                "latitude,longitude,traffic_report_status,"
@@ -206,6 +229,14 @@ def load_config():
             ids = [ids]
     user_ids = [str(u).strip() for u in ids if str(u).strip().startswith("U")]
     thresholds = cfg.get("tceq_thresholds", DEFAULT_TCEQ_THRESHOLDS)
+    # Reddit creds: GitHub secret first, then a plain env var (so a local
+    # `REDDIT_CLIENT_ID=… python3 monitor.py` can live-test without putting
+    # any secret into the PUBLIC config.json). Never read creds from cfg.
+    def secret_or_env(name):
+        return (secrets.get(name, "") or os.environ.get(name, "")).strip()
+    reddit_id = secret_or_env("REDDIT_CLIENT_ID")
+    reddit_secret = secret_or_env("REDDIT_CLIENT_SECRET")
+    reddit_user = secret_or_env("REDDIT_USERNAME") or "austin-news-bot"
     return {
         "token": token,
         "user_ids": user_ids,
@@ -218,6 +249,18 @@ def load_config():
         "tceq_thresholds": {str(k).strip().upper(): float(v)
                             for k, v in thresholds.items()},
         "tceq_recent_days": int(cfg.get("tceq_recent_days", DEFAULT_TCEQ_RECENT_DAYS)),
+        "reddit_id": reddit_id,
+        "reddit_secret": reddit_secret,
+        "reddit_user": reddit_user,
+        "reddit_enabled": bool(reddit_id and reddit_secret),
+        "reddit_subreddit": str(cfg.get("reddit_subreddit", DEFAULT_REDDIT_SUBREDDIT)),
+        "reddit_keywords": list(cfg.get("reddit_keywords", DEFAULT_REDDIT_KEYWORDS)),
+        "reddit_score_threshold": int(cfg.get("reddit_score_threshold",
+                                              DEFAULT_REDDIT_SCORE_THRESHOLD)),
+        "reddit_trending_hours": int(cfg.get("reddit_trending_hours",
+                                             DEFAULT_REDDIT_TRENDING_HOURS)),
+        "reddit_seen_prune_days": int(cfg.get("reddit_seen_prune_days",
+                                              DEFAULT_REDDIT_SEEN_PRUNE_DAYS)),
         "valid": token.startswith("xoxb-") and len(user_ids) > 0,
     }
 
@@ -237,17 +280,24 @@ def entry_from_row(row, now, alerted):
             "alerted": alerted}
 
 
-def save_state(watermark, incidents, tceq_watermark, tceq_seen):
+def save_state(watermark, incidents, tceq_watermark, tceq_seen,
+               reddit_kw_watermark=None, reddit_trending=None,
+               reddit_prune_days=DEFAULT_REDDIT_SEEN_PRUNE_DAYS):
     now = datetime.now(timezone.utc)
     cutoff = (now - PRUNE_AFTER).strftime("%Y-%m-%dT%H:%M:%SZ")
     incidents = {k: v for k, v in incidents.items()
                  if v.get("status") == "ACTIVE" or v.get("last_seen", "") >= cutoff}
     seen_cutoff = (now - TCEQ_SEEN_PRUNE).strftime("%Y-%m-%dT%H:%M:%SZ")
     tceq_seen = {k: v for k, v in tceq_seen.items() if v >= seen_cutoff}
+    reddit_trending = reddit_trending or {}
+    r_cutoff = (now - timedelta(days=reddit_prune_days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    reddit_trending = {k: v for k, v in reddit_trending.items() if v >= r_cutoff}
     STATE_FILE.write_text(json.dumps({"watermark": watermark,
                                       "incidents": incidents,
                                       "tceq_watermark": tceq_watermark,
-                                      "tceq_seen": tceq_seen}))
+                                      "tceq_seen": tceq_seen,
+                                      "reddit_kw_watermark": reddit_kw_watermark,
+                                      "reddit_trending": reddit_trending}))
 
 
 # ---------------------------------------------------------------- TCEQ spills
@@ -365,6 +415,172 @@ def process_tceq(state, cfg, now_dt):
     return dm, suppressed, True
 
 
+# --------------------------------------------------------------- reddit pulse
+
+def reddit_user_agent(cfg):
+    return "austin-pulse-monitor/1.0 (by /u/{})".format(cfg["reddit_user"])
+
+
+def reddit_token(cfg):
+    """App-only OAuth bearer for public read access; "" on any failure."""
+    auth = base64.b64encode(
+        "{}:{}".format(cfg["reddit_id"], cfg["reddit_secret"]).encode()).decode()
+    req = urllib.request.Request(
+        REDDIT_TOKEN_URL,
+        data=urllib.parse.urlencode({"grant_type": "client_credentials"}).encode(),
+        headers={"Authorization": "Basic " + auth,
+                 "User-Agent": reddit_user_agent(cfg)})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.load(resp).get("access_token", "")
+
+
+def reddit_fetch_new(token, cfg):
+    """Newest ~100 posts from /r/<sub>/new -> list of post 'data' dicts."""
+    req = urllib.request.Request(
+        "{}/r/{}/new?limit=100".format(REDDIT_OAUTH, cfg["reddit_subreddit"]),
+        headers={"Authorization": "bearer " + token,
+                 "User-Agent": reddit_user_agent(cfg)})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        children = json.load(resp).get("data", {}).get("children", [])
+    return [c["data"] for c in children if c.get("data")]
+
+
+def reddit_fetch_new_rss(cfg):
+    """Credential-free fallback: parse the public Atom feed into the SAME post
+    shape as reddit_fetch_new, but with score=None (RSS carries no upvotes, so
+    the trending pass becomes a no-op and only 🔴 keyword alerts fire)."""
+    ns = {"a": "http://www.w3.org/2005/Atom"}
+    sub = cfg["reddit_subreddit"]
+    req = urllib.request.Request(
+        "https://www.reddit.com/r/{}/new/.rss?limit=100".format(sub),
+        headers={"User-Agent": reddit_user_agent(cfg)})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        root = ET.fromstring(resp.read())
+    posts = []
+    for e in root.findall("a:entry", ns):
+        def txt(tag):
+            node = e.find("a:" + tag, ns)
+            return node.text if node is not None and node.text else ""
+        fullname = txt("id")                       # e.g. "t3_1u6r92i"
+        pid = fullname.split("_", 1)[1] if "_" in fullname else fullname
+        link_el = e.find("a:link", ns)
+        permalink = link_el.get("href") if link_el is not None else ""
+        cat = e.find("a:category", ns)
+        flair = cat.get("label") if cat is not None else None
+        if flair == "r/" + sub:                    # RSS uses this when no real flair
+            flair = None
+        try:
+            created = datetime.fromisoformat(txt("published")).timestamp()
+        except ValueError:
+            created = 0
+        body = html.unescape(re.sub(r"<[^>]+>", " ", txt("content")))
+        posts.append({"id": pid, "title": txt("title"), "selftext": body,
+                      "score": None, "num_comments": 0, "permalink": permalink,
+                      "created_utc": created, "link_flair_text": flair})
+    return posts
+
+
+def reddit_keyword_hit(text, keywords):
+    """Case-insensitive word-boundary match; phrases match literally."""
+    low = (text or "").lower()
+    return next((k for k in keywords
+                 if re.search(r"\b" + re.escape(k.lower()) + r"\b", low)), None)
+
+
+def fmt_reddit_line(emoji, label, post):
+    title = slack_escape((post.get("title") or "(untitled)").strip())
+    permalink = post.get("permalink") or ""
+    link = permalink if permalink.startswith("http") else "https://reddit.com" + permalink
+    flair = post.get("link_flair_text")
+    tag = " [{}]".format(slack_escape(flair)) if flair else ""
+    score = post.get("score")
+    stats = ""  # RSS has no scores -> score is None -> omit the ↑/💬 segment
+    if score is not None:
+        stats = " — {}↑ {}💬".format(score, post.get("num_comments", 0))
+    return "{} {}: *{}*{}{} — <{}|link>".format(emoji, label, title, tag, stats, link)
+
+
+def reddit_classify(posts, state, cfg, now_dt):
+    """Pure: decide alerts from a post list, mutate reddit_* state in place.
+
+    Returns (dm_lines, changed). 'changed' is True when reddit state must be
+    persisted (first-run seed or any alert). Low-churn: the keyword watermark
+    advances only on a keyword alert, and the trending set only grows on a
+    real threshold crossing — quiet cycles write nothing.
+    """
+    threshold = cfg["reddit_score_threshold"]
+    label = "r/" + cfg["reddit_subreddit"]
+    created = [p.get("created_utc") or 0 for p in posts]
+
+    # First run: seed, no backfill (mirrors fire/TCEQ first_run).
+    if state.get("reddit_kw_watermark") is None:
+        state["reddit_kw_watermark"] = max(created) if created else 0
+        now_iso = utc_now_iso()
+        state["reddit_trending"] = {
+            (p.get("id") or ""): now_iso for p in posts
+            if (p.get("score") or 0) >= threshold and p.get("id")}
+        log("reddit: seeded {} post(s), watermark {}".format(
+            len(posts), state["reddit_kw_watermark"]))
+        return [], True
+
+    watermark = state["reddit_kw_watermark"]
+    trending = state.setdefault("reddit_trending", {})
+    now_iso = utc_now_iso()
+    dm, alerted_ids, new_watermark = [], set(), watermark
+
+    # Keyword pass: only posts newer than the watermark.
+    for p in posts:
+        pid, ts = p.get("id"), (p.get("created_utc") or 0)
+        if not pid or ts <= watermark:
+            continue
+        hit = reddit_keyword_hit(
+            "{} {}".format(p.get("title", ""), p.get("selftext", "")),
+            cfg["reddit_keywords"])
+        if hit:
+            dm.append(fmt_reddit_line("🔴", label, p))
+            alerted_ids.add(pid)
+            new_watermark = max(new_watermark, ts)
+
+    # Trending pass: any recent post over threshold not already alerted.
+    horizon = (now_dt - timedelta(hours=cfg["reddit_trending_hours"])).timestamp()
+    for p in posts:
+        pid, ts = p.get("id"), (p.get("created_utc") or 0)
+        if (not pid or pid in trending or pid in alerted_ids
+                or ts < horizon or (p.get("score") or 0) < threshold):
+            continue
+        dm.append(fmt_reddit_line("📈", label + " trending", p))
+        trending[pid] = now_iso
+
+    # Record keyword-alerted ids in the trending set too, so a later climb
+    # doesn't re-alert the same post as 📈.
+    for pid in alerted_ids:
+        trending.setdefault(pid, now_iso)
+
+    state["reddit_kw_watermark"] = new_watermark
+    return dm, bool(dm)
+
+
+def process_reddit(state, cfg, now_dt):
+    """Fetch + classify r/<sub>. With OAuth creds -> full feed (keywords +
+    trending). Without -> credential-free RSS (keywords only; no scores).
+    Fail-isolated like TCEQ: never raises, never exits, so Reddit problems
+    can't block fire/TCEQ alerts."""
+    mode = "oauth" if cfg["reddit_enabled"] else "rss"
+    try:
+        if cfg["reddit_enabled"]:
+            token = reddit_token(cfg)
+            if not token:
+                log("reddit ERROR: no access token, will retry next run")
+                return [], False
+            posts = reddit_fetch_new(token, cfg)
+        else:
+            posts = reddit_fetch_new_rss(cfg)
+    except (API_ERRORS + (ET.ParseError,)) as e:
+        log("reddit ({}) ERROR fetch failed, will retry next run: {}".format(mode, e))
+        return [], False
+    return reddit_classify(posts, state, cfg, now_dt)
+
+
 # ------------------------------------------------------------- fire incidents
 
 def first_run(latest, cfg, dry_run):
@@ -479,7 +695,10 @@ def main():
     tceq_dm, tceq_suppressed, tceq_changed = process_tceq(state, cfg, now_dt)
     dm.extend(tceq_dm)
 
-    if not rows and not dm and not tceq_changed:
+    reddit_dm, reddit_changed = process_reddit(state, cfg, now_dt)
+    dm.extend(reddit_dm)
+
+    if not rows and not dm and not tceq_changed and not reddit_changed:
         log("no change (watermark {})".format(watermark))
         return
 
@@ -497,10 +716,13 @@ def main():
     new_watermark = max([watermark, latest]
                         + [r[":updated_at"] for r in rows if r.get(":updated_at")])
     save_state(new_watermark, incidents,
-               state.get("tceq_watermark"), state.get("tceq_seen") or {})
-    log("fire {} row(s) + tceq {} spill(s): {} DM line(s), {} suppressed; "
-        "watermark -> {}".format(len(rows), len(tceq_dm) + tceq_suppressed,
-                                 len(dm), suppressed + tceq_suppressed, new_watermark))
+               state.get("tceq_watermark"), state.get("tceq_seen") or {},
+               state.get("reddit_kw_watermark"), state.get("reddit_trending") or {},
+               cfg["reddit_seen_prune_days"])
+    log("fire {} row(s) + tceq {} spill(s) + reddit {} post(s): {} DM line(s), "
+        "{} suppressed; watermark -> {}".format(
+            len(rows), len(tceq_dm) + tceq_suppressed, len(reddit_dm),
+            len(dm), suppressed + tceq_suppressed, new_watermark))
 
 
 if __name__ == "__main__":

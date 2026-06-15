@@ -1,10 +1,20 @@
 {
   "alert_prefixes": ["BOX", "BRUSH", "ATTACK", "ALERT", "WRESQT", "RESQT",
                      "HMTF", "HMI", "HMCLAN", "FLOOD",
-                     "Traffic Injury Pri 1", "Traffic Injury Pri 2"],
+                     "Traffic Injury Pri 1"],
   "escalation_minutes": 45,
   "tceq_counties": ["TRAVIS", "WILLIAMSON", "HAYS", "BASTROP", "CALDWELL"],
   "tceq_cities": ["AUSTIN"],
   "tceq_thresholds": {"GALLONS": 1000, "BARRELS": 50, "POUNDS": 5000},
-  "tceq_recent_days": 14
+  "tceq_recent_days": 14,
+  "reddit_subreddit": "Austin",
+  "reddit_keywords": ["fire", "wildfire", "crash", "collision", "wreck", "shooting", "shooter",
+                      "active shooter", "stabbing", "police", "apd", "swat", "standoff",
+                      "evacuate", "evacuation", "flood", "flooding", "low water crossing",
+                      "tornado", "severe weather", "boil water", "power outage", "outage",
+                      "explosion", "hazmat", "amber alert", "silver alert", "protest",
+                      "closure", "i-35", "mopac", "fatal", "homicide", "missing person"],
+  "reddit_score_threshold": 50,
+  "reddit_trending_hours": 24,
+  "reddit_seen_prune_days": 3
 }

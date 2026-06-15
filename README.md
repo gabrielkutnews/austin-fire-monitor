@@ -1,11 +1,13 @@
-# Austin Fire Incident + TCEQ Spill Monitor
+# Austin Fire + TCEQ Spill + r/Austin Monitor
 
 DMs the Slack users in the `SLACK_USER_IDS` secret (via the **breakingbot** app
 in the KUT and KUTX workspace) whenever:
 - the [Austin Real-Time Fire Incidents dataset](https://data.austintexas.gov/d/wpu4-x69d)
-  gains a newsworthy incident or one changes status (e.g. ACTIVE → ARCHIVED), or
+  gains a newsworthy incident or one changes status (e.g. ACTIVE → ARCHIVED),
 - the [TCEQ Emergency Response Spills dataset](https://data.texas.gov/d/xagr-a3x2)
-  gains an Austin-area or very large spill.
+  gains an Austin-area or very large spill, or
+- [r/Austin](https://www.reddit.com/r/Austin/) gets a breaking-news-keyword post
+  or one that crosses an upvote threshold (trending).
 
 To add a recipient: get their Slack member ID (profile → ⋮ → Copy member ID)
 and re-set the full comma-separated list — no code change:
@@ -15,10 +17,11 @@ gh secret set SLACK_USER_IDS --body "U0AAAAAAAAA,U0BBBBBBBBB,Unew…"
 ```
 
 Runs every 5 minutes via **GitHub Actions** (`.github/workflows/monitor.yml`).
-**No LLM / zero tokens by design** — each
-cycle is two ~50-byte Socrata API probes (`max(:updated_at)`, one per
-dataset); only when data changed does it fetch the delta rows and post. Do
-not put Claude or any LLM in this polling loop.
+**No LLM / zero tokens by design** — each cycle is a couple of ~50-byte Socrata
+probes (`max(:updated_at)`, one per dataset) plus one `/r/Austin/new` fetch
+(credential-free RSS by default, or authenticated OAuth if creds are set);
+delta fetches happen only when data changed. Do not put Claude or any LLM in
+this polling loop.
 
 ## What gets DM'd (news filter)
 
@@ -30,8 +33,9 @@ alarms, 25/day odor/trash/CO/smoke). The filter cuts that to **~12–15 DMs/day*
   incl. midrise/hirise/marina), `BRUSH`, `ATTACK` (active attack), `ALERT`
   (aircraft emergencies), `WRESQT`/`RESQT` (water/technical rescue),
   `HMTF`/`HMI`/`HMCLAN` (hazmat), `FLOOD`, `Traffic Injury Pri 1` (incl.
-  w/Cardiac), `Traffic Injury Pri 2` (incl. Rollover; added 2026-06-11 —
-  ~6.5/day plus their closures, the single largest volume contributor).
+  w/Cardiac). (`Traffic Injury Pri 2` was removed 2026-06-15 as too noisy at
+  ~6.5/day — Pri-2 calls now only surface via the ⏱️ escalation path if one
+  runs long.)
 - ⏱️ **Escalation** — *any* incident, even a routine alarm, still ACTIVE after
   `escalation_minutes` (45). Routine calls archive at p50≈20 min / p90≈38 min
   (measured 2026-06-11), so 45+ min means a real sustained response. Fires at
@@ -50,20 +54,30 @@ alarms, 25/day odor/trash/CO/smoke). The filter cuts that to **~12–15 DMs/day*
   `rcvd_dt` within `tceq_recent_days` (14) — old re-touched rows are never
   downloaded. Expected volume: Austin-area ≈ 1/week + occasional big ones.
 
+- 🔴 **r/Austin keyword** — a new post whose title/body matches `reddit_keywords`
+  (word-boundary match, so "fire" ≠ "fired"). Works **credential-free** by
+  default (public RSS feed); each post alerts once.
+- 📈 **r/Austin trending** — any recent post (within `reddit_trending_hours`, 24)
+  that crosses `reddit_score_threshold` (50 upvotes), regardless of keywords —
+  catches whatever the community is reacting to. **Requires OAuth creds** (RSS
+  carries no upvote scores); see Secrets. Without creds, only 🔴 keyword alerts
+  fire. Reddit is fail-isolated — any Reddit error leaves fire/TCEQ unaffected.
+
 Everything else gets a `suppressed: …` / `tceq suppressed: …` line in
 `monitor.log` and is tracked in state (fire incidents can still escalate). To
 tune: edit `alert_prefixes` (prefix match against `issue_reported`; e.g. add
 `"RESQV"` for vehicle pin-ins ~0.8/day, or `"ELEC"` for electrical fires
-~3/day), `escalation_minutes`, `tceq_counties`/`tceq_cities`/`tceq_thresholds`
-— no code changes.
+~3/day), `escalation_minutes`, `tceq_counties`/`tceq_cities`/`tceq_thresholds`,
+or `reddit_keywords`/`reddit_score_threshold`/`reddit_trending_hours` — no code
+changes.
 
 ## Files
 
 | File | Purpose |
 |---|---|
 | `monitor.py` | The whole monitor (python3 stdlib only) |
-| `config.json` | Non-secret knobs: `alert_prefixes`, `escalation_minutes`, `tceq_*` (committed) |
-| `state.json` | Fire watermark + incident statuses, `tceq_watermark` + `tceq_seen` dedupe (script-managed, committed back each run; delete to re-trigger the "Monitoring started" DM) |
+| `config.json` | Non-secret knobs: `alert_prefixes`, `escalation_minutes`, `tceq_*`, `reddit_*` (committed) |
+| `state.json` | Fire watermark + statuses, `tceq_watermark`/`tceq_seen`, `reddit_kw_watermark`/`reddit_trending` dedupe (script-managed, committed back each run; delete to re-seed all sources) |
 | `.github/workflows/monitor.yml` | Schedules the run every 5 min and persists `state.json` |
 | `monitor.log` | Local launchd output (gitignored; cloud logs live in the Actions run console) |
 
@@ -82,6 +96,30 @@ secret set as one JSON env var (`ALL_SECRETS: ${{ toJSON(secrets) }}`), and
 gh secret set SLACK_BOT_TOKEN   --body 'xoxb-…'
 gh secret set SLACK_USER_IDS    --body 'U0AAAAAAAAA,U0BBBBBBBBB,U0CCCCCCCCC'
 ```
+
+Optional — the r/Austin source runs credential-free via RSS (🔴 keyword alerts).
+These secrets upgrade it to authenticated OAuth and add 📈 **trending** (RSS has
+no upvote scores). Without them, only keyword alerts fire:
+
+| Secret | Value |
+|---|---|
+| `REDDIT_CLIENT_ID` | The string under the app name on reddit.com/prefs/apps |
+| `REDDIT_CLIENT_SECRET` | The app's `secret` |
+| `REDDIT_USERNAME` | Your Reddit username (used only in the API User-Agent) |
+
+To create the app: **reddit.com/prefs/apps → "create another app…" → type
+`script`** → name it (e.g. `austin-pulse-monitor`), redirect URI
+`http://localhost:8080` (unused). Then:
+
+```bash
+gh secret set REDDIT_CLIENT_ID     --body '…'
+gh secret set REDDIT_CLIENT_SECRET --body '…'
+gh secret set REDDIT_USERNAME      --body 'your_reddit_username'
+```
+
+Reddit uses app-only OAuth (`grant_type=client_credentials`) for public read
+access — no Reddit password is stored. One authenticated `/r/Austin/new` call
+per cycle sits well inside the free 100-calls/min quota.
 
 **Adding more secrets later needs no workflow edit** — thanks to the
 `toJSON(secrets)` auto-map, `gh secret set NEW_NAME` is enough; read it in code
@@ -111,6 +149,11 @@ Local (optional, for testing):
 ```bash
 ALL_SECRETS='{"SLACK_BOT_TOKEN":"xoxb-…","SLACK_USER_IDS":"U…"}' \
   python3 ~/austin-fire-monitor/monitor.py --dry-run    # print instead of DM
+
+# Reddit creds can also be passed as plain env vars (handy for a local live test
+# without putting them in the PUBLIC config.json):
+REDDIT_CLIENT_ID=… REDDIT_CLIENT_SECRET=… REDDIT_USERNAME=… \
+  python3 ~/austin-fire-monitor/monitor.py --dry-run
 ```
 
 To test end-to-end: edit `state.json`, set `watermark` back an hour or two,
