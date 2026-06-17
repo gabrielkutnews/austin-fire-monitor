@@ -1,35 +1,28 @@
 name: Austin Fire Monitor
 on:
   schedule:
-    - cron: '*/5 * * * *'
-  workflow_dispatch: {}        # manual trigger for testing
+    - cron: '0 * * * *'        # hourly BACKSTOP only — loop.sh owns the cadence
+  workflow_dispatch: {}        # manual trigger + how the loop chains itself
 
-concurrency:                   # serialize runs so state.json never conflicts
+concurrency:                   # one loop at a time; next run starts when this exits
   group: austin-fire-monitor
   cancel-in-progress: false
 
 permissions:
-  contents: write              # needed to commit state.json back
+  contents: write              # commit state.json back
+  actions: write               # let loop.sh self-trigger the next run
 
 jobs:
   monitor:
     runs-on: ubuntu-latest
+    timeout-minutes: 355        # loop exits at 340 min; buffer before the 6h cap
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.x'
-      - name: Run monitor
+      - name: Poll loop (every ~5 min for ~5h40m, then chain the next run)
         env:
           ALL_SECRETS: ${{ toJSON(secrets) }}   # every secret, auto-mapped
-        run: python3 monitor.py
-      - name: Persist state
-        if: always()
-        run: |
-          if [[ -n "$(git status --porcelain state.json)" ]]; then
-            git config user.name  "github-actions[bot]"
-            git config user.email "github-actions[bot]@users.noreply.github.com"
-            git add state.json
-            git commit -m "Update state [skip ci]"
-            git push
-          fi
+          GH_TOKEN: ${{ github.token }}          # for `gh workflow run` self-trigger
+        run: bash loop.sh

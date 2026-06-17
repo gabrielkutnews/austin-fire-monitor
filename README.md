@@ -16,8 +16,16 @@ and re-set the full comma-separated list — no code change:
 gh secret set SLACK_USER_IDS --body "U0AAAAAAAAA,U0BBBBBBBBB,Unew…"
 ```
 
-Runs every 5 minutes via **GitHub Actions** (`.github/workflows/monitor.yml`).
-**No LLM / zero tokens by design** — each cycle is a couple of ~50-byte Socrata
+Polls every **~5 minutes** via **GitHub Actions** (`.github/workflows/monitor.yml`).
+Cadence does **not** rely on cron — GitHub throttles scheduled cron badly (we
+measured 4–19h gaps). Instead, `loop.sh` runs one job that polls every ~5 min
+for ~5h40m, then chains the next run via `gh workflow run`; a `concurrency`
+group keeps exactly one loop alive and the **hourly** cron is only a backstop
+if a job ever dies without chaining. State (`state.json`) stays in the runner
+between polls and is committed back every ~30 min + at job exit. Free: public
+repos get unlimited Actions minutes.
+
+**No LLM / zero tokens by design** — each poll is a couple of ~50-byte Socrata
 probes (`max(:updated_at)`, one per dataset) plus one `/r/Austin/new` fetch
 (credential-free RSS by default, or authenticated OAuth if creds are set);
 delta fetches happen only when data changed. Do not put Claude or any LLM in
@@ -78,7 +86,8 @@ changes.
 | `monitor.py` | The whole monitor (python3 stdlib only) |
 | `config.json` | Non-secret knobs: `alert_prefixes`, `escalation_minutes`, `tceq_*`, `reddit_*` (committed) |
 | `state.json` | Fire watermark + statuses, `tceq_watermark`/`tceq_seen`, `reddit_kw_watermark`/`reddit_trending` dedupe (script-managed, committed back each run; delete to re-seed all sources) |
-| `.github/workflows/monitor.yml` | Schedules the run every 5 min and persists `state.json` |
+| `loop.sh` | Poll loop wrapper: runs `monitor.py` every ~5 min for ~5h40m, checkpoints state, chains the next run (decouples cadence from cron) |
+| `.github/workflows/monitor.yml` | Runs `loop.sh`; hourly cron + concurrency are the restart backstop |
 | `monitor.log` | Local launchd output (gitignored; cloud logs live in the Actions run console) |
 
 ## Secrets
@@ -140,15 +149,25 @@ account `slack-bot-token`) and then to a `slack_bot_token`/`slack_user_ids` in
 
 Cloud (primary):
 ```bash
-gh workflow run "Austin Fire Monitor"   # trigger a run now
-gh run watch                            # watch the latest run
-gh run list --workflow=monitor.yml      # recent runs
+gh workflow run "Austin Fire Monitor"   # start a loop now (also how it self-chains)
+gh run watch                            # watch the active loop
+gh run list --workflow=monitor.yml      # recent runs (should be ~back-to-back)
+```
+
+Stop it (the loop self-restarts, so cancelling one run isn't enough):
+```bash
+gh workflow disable "Austin Fire Monitor"   # stop the chain (no new runs)
+gh run cancel <run-id>                       # end the loop currently running
+# re-enable later with: gh workflow enable "Austin Fire Monitor"
 ```
 
 Local (optional, for testing):
 ```bash
 ALL_SECRETS='{"SLACK_BOT_TOKEN":"xoxb-…","SLACK_USER_IDS":"U…"}' \
-  python3 ~/austin-fire-monitor/monitor.py --dry-run    # print instead of DM
+  python3 ~/austin-fire-monitor/monitor.py --dry-run    # one poll, print instead of DM
+
+# Exercise the loop wrapper itself (skips git/gh when not in CI):
+POLL_INTERVAL=15 MAX_RUNTIME=45 bash ~/austin-fire-monitor/loop.sh --dry-run
 
 # Reddit creds can also be passed as plain env vars (handy for a local live test
 # without putting them in the PUBLIC config.json):
