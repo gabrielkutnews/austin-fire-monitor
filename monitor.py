@@ -74,6 +74,12 @@ DEFAULT_PREFIXES = ["BOX", "BRUSH", "ATTACK", "ALERT", "WRESQT", "RESQT",
                     "HMTF", "HMI", "HMCLAN", "FLOOD",
                     "Traffic Injury Pri 1"]
 DEFAULT_ESCALATION_MIN = 45
+# Categories never worth a "still ACTIVE after N min" escalation (low news value);
+# prefix-matched against issue_reported. Escalation still fires for everything else
+# (e.g. GRASS/ELEC fires, Hazardous Condition).
+DEFAULT_ESCALATION_EXCLUDE = ["ODOR", "RESQV", "Traffic Injury Pri 2 Rollover",
+                              "ALARM", "ALARMM", "ALARMH", "BWP", "SMOKE",
+                              "Traffic Injury Pri 2", "AUTO", "TRASH"]
 DEFAULT_TCEQ_COUNTIES = ["TRAVIS", "WILLIAMSON", "HAYS", "BASTROP", "CALDWELL"]
 DEFAULT_TCEQ_CITIES = ["AUSTIN"]
 DEFAULT_TCEQ_THRESHOLDS = {"GALLONS": 1000, "BARRELS": 50, "POUNDS": 5000}
@@ -242,6 +248,8 @@ def load_config():
         "user_ids": user_ids,
         "prefixes": list(cfg.get("alert_prefixes", DEFAULT_PREFIXES)),
         "escalation_min": int(cfg.get("escalation_minutes", DEFAULT_ESCALATION_MIN)),
+        "escalation_exclude_prefixes": list(cfg.get("escalation_exclude_prefixes",
+                                                    DEFAULT_ESCALATION_EXCLUDE)),
         "tceq_counties": {str(c).strip().upper()
                           for c in cfg.get("tceq_counties", DEFAULT_TCEQ_COUNTIES)},
         "tceq_cities": {str(c).strip().upper()
@@ -592,9 +600,9 @@ def first_run(latest, cfg, dry_run):
     incidents = {r["traffic_report_id"]: entry_from_row(r, now, False)
                  for r in active if r.get("traffic_report_id")}
     text = ("✅ Austin fire-incident monitor started — {} active incident(s) right now. "
-            "DMs are filtered for news value (🚨 alert categories, ⏱️ anything active "
-            ">{} min, 🔚 closures of alerted incidents, 🛢️ Austin-area or very large "
-            "TCEQ spills); the rest is logged. Watching <{}|the dataset> every 5 minutes."
+            "DMs are filtered for news value (🚨 alert categories, ⏱️ select incidents "
+            "still active >{} min, 🛢️ Austin-area or very large TCEQ spills, 🔴 r/Austin "
+            "keywords); the rest is logged. Watching <{}|the dataset> every 5 minutes."
             ).format(len(incidents), cfg["escalation_min"], FIRE_PAGE)
     post_to_slack(cfg, text, dry_run)
     save_state(latest, incidents, None, {})
@@ -662,25 +670,17 @@ def main():
             prev_status = known.get("status")
             entry = entry_from_row(row, now, known.get("alerted", False))
             if prev_status != status:
-                if entry["alerted"]:
-                    after = ""
-                    end = row.get("traffic_report_status_date_time")
-                    if entry["published"] and end:
-                        mins = (parse_utc(end) - parse_utc(entry["published"])
-                                ).total_seconds() / 60
-                        after = " after " + fmt_duration(mins)
-                    dm.append("🔚 *{}* — {} — {} → {}{}".format(
-                        issue, place(row), prev_status, status, after))
-                else:
-                    log("suppressed status change: {} — {} -> {}".format(
-                        issue_raw, prev_status, status))
+                # Closures ("case ended") are no longer DM'd — log only.
+                log("status change: {} — {} -> {}".format(issue_raw, prev_status, status))
             incidents[rid] = entry
 
     # Escalation pass: runs every cycle, including no-change cycles, because
     # an incident escalates by time passing, not by its row being touched.
     for entry in incidents.values():
         if (entry.get("status") == "ACTIVE" and not entry.get("alerted")
-                and entry.get("published")):
+                and entry.get("published")
+                and not is_alertable(entry.get("issue") or "",
+                                     cfg["escalation_exclude_prefixes"])):
             try:
                 pub = parse_utc(entry["published"])
             except ValueError:
