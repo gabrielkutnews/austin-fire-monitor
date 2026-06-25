@@ -47,6 +47,17 @@ while [ $(( $(date +%s) - start )) -lt "$MAX_RUNTIME" ]; do
     commit_state
     last_commit=$now
   fi
+  # Restart promptly if a real code/config change was pushed upstream, so edits
+  # go live within ~one poll instead of waiting out the full MAX_RUNTIME. The
+  # diff excludes state.json, so the loop's own state commits never trigger it.
+  if in_ci; then
+    git fetch -q origin main 2>/dev/null || true
+    if ! git diff --quiet HEAD origin/main -- config.json monitor.py loop.sh \
+         .github/workflows/monitor.yml 2>/dev/null; then
+      echo "loop: upstream code/config changed — restarting to pick it up"
+      break
+    fi
+  fi
   sleep "$POLL_INTERVAL"
 done
 
