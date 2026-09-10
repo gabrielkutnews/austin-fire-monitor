@@ -209,22 +209,17 @@ def load_config():
         cfg = json.loads(CONFIG_FILE.read_text())
     except (OSError, ValueError):
         cfg = {}
-    # On GitHub Actions the whole secret set is injected as one JSON env var
-    # (ALL_SECRETS = ${{ toJSON(secrets) }}). Parse it once; absent locally.
-    secrets = {}
-    raw = os.environ.get("ALL_SECRETS", "")
-    if raw:
-        try:
-            secrets = json.loads(raw)
-        except ValueError:
-            secrets = {}
+    # Secrets arrive as individual env vars, each mapped by name in
+    # monitor.yml; locally they are just ordinary env vars.
+    def secret_or_env(name):
+        return os.environ.get(name, "").strip()
     # Token: secret first, then Keychain, then config.json (Keychain/config are
     # the local fallbacks — this Mac's login keychain needs a manual unlock).
-    token = (secrets.get("SLACK_BOT_TOKEN", "").strip()
+    token = (secret_or_env("SLACK_BOT_TOKEN")
              or keychain_token() or cfg.get("slack_bot_token", ""))
     # Recipients: SLACK_USER_IDS secret (comma/space/newline-separated), else
     # the config.json list (legacy single slack_user_id still honored).
-    ids_raw = secrets.get("SLACK_USER_IDS", "")
+    ids_raw = secret_or_env("SLACK_USER_IDS")
     if ids_raw:
         ids = re.split(r"[,\s]+", ids_raw.strip())
     else:
@@ -235,11 +230,9 @@ def load_config():
             ids = [ids]
     user_ids = [str(u).strip() for u in ids if str(u).strip().startswith("U")]
     thresholds = cfg.get("tceq_thresholds", DEFAULT_TCEQ_THRESHOLDS)
-    # Reddit creds: GitHub secret first, then a plain env var (so a local
-    # `REDDIT_CLIENT_ID=… python3 monitor.py` can live-test without putting
-    # any secret into the PUBLIC config.json). Never read creds from cfg.
-    def secret_or_env(name):
-        return (secrets.get(name, "") or os.environ.get(name, "")).strip()
+    # Reddit creds from the env (GitHub secret in CI, or a plain env var so a
+    # local `REDDIT_CLIENT_ID=… python3 monitor.py` can live-test without
+    # putting any secret into the PUBLIC config.json). Never read from cfg.
     reddit_id = secret_or_env("REDDIT_CLIENT_ID")
     reddit_secret = secret_or_env("REDDIT_CLIENT_SECRET")
     reddit_user = secret_or_env("REDDIT_USERNAME") or "austin-news-bot"
