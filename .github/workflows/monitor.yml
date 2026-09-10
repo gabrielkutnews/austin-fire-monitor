@@ -23,6 +23,13 @@ jobs:
           python-version: '3.x'
       - name: Poll loop (every ~5 min for ~5h40m, then chain the next run)
         env:
-          ALL_SECRETS: ${{ toJSON(secrets) }}   # every secret, auto-mapped
+          # Each secret mapped by name — never toJSON(secrets), which dumps the
+          # whole secret set into one env var and trips GitHub's malicious-
+          # workflow heuristic (it's the standard exfiltration pattern).
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_USER_IDS: ${{ secrets.SLACK_USER_IDS }}
+          REDDIT_CLIENT_ID: ${{ secrets.REDDIT_CLIENT_ID }}
+          REDDIT_CLIENT_SECRET: ${{ secrets.REDDIT_CLIENT_SECRET }}
+          REDDIT_USERNAME: ${{ secrets.REDDIT_USERNAME }}
           GH_TOKEN: ${{ github.token }}          # for `gh workflow run` self-trigger
         run: bash loop.sh
